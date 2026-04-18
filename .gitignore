@@ -1,0 +1,6 @@
+.DS_Store
+.claude/
+data/debug/
+__pycache__/
+*.pyc
+.env
