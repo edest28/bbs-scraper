@@ -1,0 +1,78 @@
+# ============================================================
+# BizBuySell Scraper — Configuration
+# Edit this file to change all filtering and scoring behavior.
+# No code changes needed.
+# ============================================================
+
+
+# --- HARD FILTERS -----------------------------------------------
+# Listings that fail ANY filter are excluded before scoring.
+
+filters:
+  # US state codes to search
+  locations:
+    - NY
+    - MA
+    - CT
+
+  # Business categories to EXCLUDE (case-insensitive, partial match)
+  excluded_categories:
+    - Restaurant
+    - Restaurants
+    - Food & Beverage
+    - Bar
+    - Cafe
+    - Bakery
+    - Diner
+    - Pizza
+    - Fast Food
+
+  # Minimum SDE or EBITDA (whichever the listing reports)
+  min_cash_flow: 500000  # $500,000
+
+
+# --- SCORING ----------------------------------------------------
+# Each factor is scored 0–100, then multiplied by its weight.
+# Final score = weighted sum (0–100). Weights must sum to 1.0.
+
+scoring:
+  weights:
+    ebitda_sde_multiple: 0.60   # Most important: valuation multiple
+    cash_flow_absolute:  0.30   # Second: raw earnings power
+    seller_financing:    0.10   # Bonus: financing flexibility
+
+  # EBITDA / SDE Multiple scoring
+  # Sweet spot is 3x–6x (competitive but not overpriced).
+  # Outside the range, score decays.
+  multiple:
+    ideal_min: 3.0              # Below this = suspiciously cheap or distressed
+    ideal_max: 6.0              # Above this = expensive
+    floor_threshold: 1.5        # Below this = 0 points (almost certainly broken)
+    ceiling_threshold: 10.0     # Above this = 0 points (not worth pursuing)
+
+  # Cash flow absolute scoring — tiered
+  # Tiers are evaluated top-down; first match wins.
+  cash_flow_tiers:
+    - min: 2000000    # $2M+  → 100 pts
+      score: 100
+    - min: 1500000    # $1.5M → 85 pts
+      score: 85
+    - min: 1000000    # $1M   → 70 pts
+      score: 70
+    - min: 750000     # $750K → 50 pts
+      score: 50
+    - min: 500000     # $500K (floor) → 30 pts
+      score: 30
+
+
+# --- SEARCH CONFIGURATION ---------------------------------------
+
+search:
+  # Maps state code → BizBuySell URL slug
+  state_slugs:
+    NY: new-york
+    MA: massachusetts
+    CT: connecticut
+
+  max_pages_per_state: 10      # Max result pages to scan per state
+  request_delay_seconds: 2.5   # Seconds to wait between requests

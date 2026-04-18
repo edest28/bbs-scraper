@@ -1,0 +1,46 @@
+name: BBS Business Scout
+
+on:
+  # Daily at 9:00 AM ET (13:00 UTC) — works even when your Mac is asleep
+  schedule:
+    - cron: "0 13 * * *"
+
+  # Manual trigger — click "Run workflow" button in the Actions tab anytime
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to commit data/ and docs/ back to the repo
+  pages: write
+  id-token: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history so we can commit without conflict
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        run: python run.py
+
+      - name: Commit updated data and dashboard
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/seen_ids.json data/all_listings.json docs/index.html
+          # Only commit if something actually changed
+          git diff --staged --quiet || git commit -m "scrape: $(date -u +%Y-%m-%d)"
+          git push
