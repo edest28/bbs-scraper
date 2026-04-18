@@ -1,21 +1,24 @@
 """
-scraper.py — Fetches business listings from BizBuySell.
+scraper.py — Fetches business listings from BizBuySell via ScraperAPI.
 
-Workflow:
-  1. For each configured state, paginate through search results to collect listing URLs.
-  2. For each new listing URL (not in seen_ids), fetch the detail page.
-  3. Parse and return structured listing data.
+BizBuySell uses Akamai bot protection that blocks headless browsers and
+plain HTTP clients. ScraperAPI routes requests through residential proxies
+that Akamai cannot distinguish from real users.
 
-BizBuySell blocks plain HTTP clients; we mimic a real browser with headers and
-paced requests. If selectors break after a BBS redesign, enable DEBUG_HTML=True
-in run.py to dump raw HTML to data/debug/ for inspection.
+Sign up for a free key (5,000 req/month — enough for daily runs) at:
+  https://www.scraperapi.com
+
+Set it as:
+  - GitHub secret: SCRAPER_API_KEY (Actions tab → Secrets)
+  - Local: export SCRAPER_API_KEY=your_key  (or add to .env)
 """
 
+import os
 import re
 import time
 import logging
 from typing import Optional
-from urllib.parse import urljoin
+from urllib.parse import urlencode
 
 import requests
 from bs4 import BeautifulSoup
@@ -23,6 +26,8 @@ from bs4 import BeautifulSoup
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://www.bizbuysell.com"
+SCRAPER_API_ENDPOINT = "https://api.scraperapi.com/"
+LISTING_ID_RE = re.compile(r"/(\d+)/?$")
 
 HEADERS = {
     "User-Agent": (
@@ -30,30 +35,57 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Cache-Control": "max-age=0",
 }
+
+
+# ---------------------------------------------------------------------------
+# HTTP layer
+# ---------------------------------------------------------------------------
+
+def _get_api_key() -> str:
+    key = os.getenv("SCRAPER_API_KEY", "").strip()
+    if not key:
+        raise EnvironmentError(
+            "SCRAPER_API_KEY is not set.\n"
+            "Sign up free at https://www.scraperapi.com, then:\n"
+            "  export SCRAPER_API_KEY=your_key   (local)\n"
+            "  Add as GitHub secret SCRAPER_API_KEY  (Actions)"
+        )
+    return key
+
+
+def _fetch(url: str, session: requests.Session, retries: int = 2) -> Optional[str]:
+    """Fetch a URL through ScraperAPI, returning HTML text or None."""
+    api_key = _get_api_key()
+    params = {
+        "api_key": api_key,
+        "url": url,
+        "render": "false",   # JS rendering costs 5× credits; BBS is server-rendered
+        "keep_headers": "false",
+    }
+    api_url = f"{SCRAPER_API_ENDPOINT}?{urlencode(params)}"
+
+    for attempt in range(1, retries + 2):
+        try:
+            resp = session.get(api_url, timeout=60)
+            if resp.status_code == 200:
+                return resp.text
+            logger.warning("ScraperAPI returned %s for %s (attempt %d)", resp.status_code, url, attempt)
+        except requests.RequestException as exc:
+            logger.warning("Request error for %s (attempt %d): %s", url, attempt, exc)
+
+        if attempt <= retries:
+            time.sleep(3 * attempt)
+
+    return None
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update(HEADERS)
-    return s
-
-
 def _parse_money(text: str) -> Optional[float]:
-    """Convert money strings like '$1,250,000' or '$1.2M' to float."""
     if not text:
         return None
     text = text.strip()
@@ -80,32 +112,28 @@ def _parse_money(text: str) -> Optional[float]:
 
 
 def _extract_listing_id(url: str) -> Optional[str]:
-    """Pull the numeric listing ID from a BizBuySell URL."""
-    match = re.search(r"/(\d+)/?$", url.rstrip("/"))
+    match = LISTING_ID_RE.search(url.rstrip("/"))
     return match.group(1) if match else None
 
 
 def _find_value_by_label(soup: BeautifulSoup, *labels: str) -> Optional[float]:
-    """
-    Search for a financial value on the page by scanning for label text.
-    Tries multiple strategies to handle layout variations.
-    """
+    """Find a financial value by scanning for its label text."""
     for label in labels:
         pattern = re.compile(rf"\b{re.escape(label)}\b", re.I)
 
         for node in soup.find_all(string=pattern):
             parent = node.parent
-            if parent is None:
+            if not parent:
                 continue
 
-            # Strategy 1: value is in a sibling element
+            # Strategy 1: value in next sibling element
             sibling = parent.find_next_sibling()
             if sibling:
                 val = _parse_money(sibling.get_text(strip=True))
                 if val is not None:
                     return val
 
-            # Strategy 2: value is in parent's next sibling
+            # Strategy 2: value in grandparent's next sibling
             grandparent = parent.parent
             if grandparent:
                 uncle = grandparent.find_next_sibling()
@@ -114,15 +142,16 @@ def _find_value_by_label(soup: BeautifulSoup, *labels: str) -> Optional[float]:
                     if val is not None:
                         return val
 
-            # Strategy 3: label and value share a container — look for money pattern
-            container = grandparent or parent
-            if container:
-                text = container.get_text(" ", strip=True)
-                money_match = re.search(r"\$[\d,]+(?:\.\d+)?(?:\s*[KMB])?", text)
-                if money_match:
-                    val = _parse_money(money_match.group())
-                    if val is not None:
-                        return val
+        # Strategy 3: regex on full page text for "Label: $X"
+        body = soup.get_text(" ", strip=True)
+        match = re.search(
+            rf"\b{re.escape(label)}\b[:\s]*(\$[\d,]+(?:\.\d+)?(?:\s*[KMB])?)",
+            body, re.I,
+        )
+        if match:
+            val = _parse_money(match.group(1))
+            if val is not None:
+                return val
 
     return None
 
@@ -131,43 +160,30 @@ def _find_value_by_label(soup: BeautifulSoup, *labels: str) -> Optional[float]:
 # Search result page scraping
 # ---------------------------------------------------------------------------
 
-def get_listing_urls_for_state(
+def _get_listing_urls_for_state(
     session: requests.Session,
     state_slug: str,
-    max_pages: int = 10,
-    delay: float = 2.5,
+    max_pages: int,
+    delay: float,
 ) -> list[dict]:
-    """
-    Paginate through BizBuySell search results for one state.
-    Returns list of {id, url} dicts for all listings found.
-    """
     results: list[dict] = []
     seen_ids: set[str] = set()
-    listing_url_pattern = re.compile(r"/Business-Opportunity/", re.I)
 
-    for page in range(1, max_pages + 1):
-        search_url = f"{BASE_URL}/{state_slug}/businesses-for-sale/?pg={page}"
-        logger.info("Fetching search page: %s", search_url)
+    for page_num in range(1, max_pages + 1):
+        url = f"{BASE_URL}/{state_slug}/businesses-for-sale/?pg={page_num}"
+        logger.info("Fetching search page: %s", url)
 
-        try:
-            resp = session.get(search_url, timeout=30)
-        except requests.RequestException as exc:
-            logger.error("Request failed for %s: %s", search_url, exc)
+        html = _fetch(url, session)
+        if not html:
+            logger.warning("No HTML returned for %s — stopping.", url)
             break
 
-        if resp.status_code == 403:
-            logger.warning("403 Forbidden on %s — BBS may be blocking the request.", search_url)
-            break
-        if resp.status_code != 200:
-            logger.warning("HTTP %s on %s", resp.status_code, search_url)
-            break
+        soup = BeautifulSoup(html, "lxml")
 
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        # Collect all links that look like listing detail pages
-        links = soup.find_all("a", href=listing_url_pattern)
+        # Collect all hrefs that look like BizBuySell listing detail URLs
+        links = soup.find_all("a", href=re.compile(r"/Business-Opportunity/", re.I))
         if not links:
-            logger.info("No listing links on page %d — stopping pagination.", page)
+            logger.info("No listing links on page %d — stopping pagination for %s.", page_num, state_slug)
             break
 
         new_count = 0
@@ -175,20 +191,19 @@ def get_listing_urls_for_state(
             href = link.get("href", "")
             if not href:
                 continue
-            full_url = urljoin(BASE_URL, href)
+            full_url = href if href.startswith("http") else f"{BASE_URL}{href}"
             listing_id = _extract_listing_id(href)
             if listing_id and listing_id not in seen_ids:
                 seen_ids.add(listing_id)
                 results.append({"id": listing_id, "url": full_url})
                 new_count += 1
 
-        logger.info("Page %d: found %d new listing URLs (total so far: %d)", page, new_count, len(results))
+        logger.info("Page %d: %d new listing URLs (state total: %d)", page_num, new_count, len(results))
 
-        # Stop if there's no "Next" pagination link
-        next_link = soup.find("a", string=re.compile(r"next", re.I)) or \
-                    soup.find("a", attrs={"rel": "next"})
-        if not next_link:
-            logger.info("No next-page link found — end of results for %s.", state_slug)
+        # Stop if no next-page link
+        if not soup.find("a", string=re.compile(r"next", re.I)) and \
+           not soup.find("a", attrs={"rel": "next"}):
+            logger.info("No next-page link — end of results for %s.", state_slug)
             break
 
         time.sleep(delay)
@@ -200,104 +215,69 @@ def get_listing_urls_for_state(
 # Listing detail page scraping
 # ---------------------------------------------------------------------------
 
-def get_listing_detail(
+def _get_listing_detail(
     session: requests.Session,
     listing_id: str,
     url: str,
-    delay: float = 2.5,
-    debug_html_dir: Optional[str] = None,
+    delay: float,
+    debug_html_dir: Optional[str],
 ) -> Optional[dict]:
-    """
-    Fetch and parse a single listing detail page.
-    Returns a dict with all extracted fields, or None on failure.
-    """
     time.sleep(delay)
     logger.info("Fetching detail: %s", url)
 
-    try:
-        resp = session.get(url, timeout=30)
-    except requests.RequestException as exc:
-        logger.error("Request failed for %s: %s", url, exc)
-        return None
-
-    if resp.status_code != 200:
-        logger.warning("HTTP %s for listing %s", resp.status_code, listing_id)
+    html = _fetch(url, session)
+    if not html:
         return None
 
     if debug_html_dir:
-        import os
-        os.makedirs(debug_html_dir, exist_ok=True)
+        import os as _os
+        _os.makedirs(debug_html_dir, exist_ok=True)
         with open(f"{debug_html_dir}/{listing_id}.html", "w", encoding="utf-8") as f:
-            f.write(resp.text)
+            f.write(html)
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
     data: dict = {"id": listing_id, "url": url}
+    full_text = soup.get_text(" ", strip=True)
 
     # --- Name ---
     for selector in ["h1.bfsTitle", "h1.listing-title", "h1", "h2.bfsTitle"]:
         el = soup.select_one(selector)
-        if el:
+        if el and el.get_text(strip=True):
             data["name"] = el.get_text(strip=True)
             break
     data.setdefault("name", "Unknown Business")
 
     # --- Location ---
-    for selector in [
-        ".bfsRequest .city",
-        ".listing-location",
-        "[class*='location']",
-        "[class*='Location']",
-    ]:
+    for selector in [".bfsRequest .city", ".listing-location", "[class*='location']"]:
         el = soup.select_one(selector)
-        if el:
+        if el and el.get_text(strip=True):
             data["location"] = el.get_text(strip=True)
             break
     if "location" not in data:
-        # Fallback: grep for "City, ST" pattern in full text
-        loc_match = re.search(
-            r"\b([A-Z][a-zA-Z\s]+),\s*(NY|MA|CT)\b", soup.get_text()
-        )
+        loc_match = re.search(r"\b([A-Z][a-zA-Z\s]+),\s*(NY|MA|CT)\b", full_text)
         if loc_match:
             data["location"] = loc_match.group(0)
 
-    # --- Category / Industry ---
-    for selector in [
-        ".bfsRequest .category",
-        "[class*='category']",
-        "[class*='industry']",
-        "[class*='Industry']",
-    ]:
+    # --- Category ---
+    for selector in [".bfsRequest .category", "[class*='category']", "[class*='industry']"]:
         el = soup.select_one(selector)
         if el and el.get_text(strip=True):
             data["category"] = el.get_text(strip=True)
             break
 
     # --- Financial fields ---
-    data["asking_price"] = _find_value_by_label(soup, "Asking Price", "Listing Price")
-    data["cash_flow"] = _find_value_by_label(
-        soup, "Cash Flow", "Owner's Benefit", "Total Owner's Benefit", "Seller's Discretionary Earnings"
-    )
-    data["revenue"] = _find_value_by_label(soup, "Gross Revenue", "Gross Income", "Revenue")
-    data["ebitda"] = _find_value_by_label(soup, "EBITDA", "Adjusted EBITDA")
-    data["sde"] = _find_value_by_label(soup, "SDE", "Seller's Discretionary Earnings", "Owner Benefit")
-
-    # Unify: prefer EBITDA, fall back to SDE, fall back to cash_flow
+    data["asking_price"]  = _find_value_by_label(soup, "Asking Price", "Listing Price")
+    data["cash_flow"]     = _find_value_by_label(soup, "Cash Flow", "Owner's Benefit", "Total Owner's Benefit")
+    data["revenue"]       = _find_value_by_label(soup, "Gross Revenue", "Gross Income", "Revenue")
+    data["ebitda"]        = _find_value_by_label(soup, "EBITDA", "Adjusted EBITDA")
+    data["sde"]           = _find_value_by_label(soup, "SDE", "Seller's Discretionary Earnings", "Owner Benefit")
     data["ebitda_or_sde"] = data["ebitda"] or data["sde"] or data["cash_flow"]
 
     # --- Seller Financing ---
-    full_text = soup.get_text()
-    data["seller_financing"] = bool(
-        re.search(r"seller\s+financ(ing|ed)", full_text, re.I)
-    )
+    data["seller_financing"] = bool(re.search(r"seller\s+financ(ing|ed)", full_text, re.I))
 
     # --- Description ---
-    for selector in [
-        "#listingDescription",
-        ".bfsRequest .description",
-        "[class*='description']",
-        "[id*='description']",
-        ".listing-description",
-    ]:
+    for selector in ["#listingDescription", ".bfsRequest .description", "[class*='description']"]:
         el = soup.select_one(selector)
         if el and len(el.get_text(strip=True)) > 50:
             data["description"] = el.get_text(" ", strip=True)[:2500]
@@ -305,8 +285,7 @@ def get_listing_detail(
 
     # --- Year Established ---
     year_match = re.search(
-        r"(?:established|founded|in business since|operating since)\s+(?:in\s+)?(\d{4})",
-        full_text, re.I,
+        r"(?:established|founded|in business since)\s+(?:in\s+)?(\d{4})", full_text, re.I
     )
     if year_match:
         data["year_established"] = int(year_match.group(1))
@@ -316,7 +295,7 @@ def get_listing_detail(
     if emp_match:
         data["employees"] = int(emp_match.group(1))
 
-    logger.debug("Parsed listing %s: %s", listing_id, {k: v for k, v in data.items() if k != "description"})
+    logger.debug("Parsed %s: %s", listing_id, {k: v for k, v in data.items() if k != "description"})
     return data
 
 
@@ -324,44 +303,40 @@ def get_listing_detail(
 # Public API
 # ---------------------------------------------------------------------------
 
-def scrape_new_listings(config: dict, seen_ids: set[str]) -> list[dict]:
-    """
-    Main entry point for the scraper.
-    Returns parsed detail dicts for listings not in seen_ids.
-    """
+def scrape_new_listings(
+    config: dict,
+    seen_ids: set[str],
+    debug_html_dir: Optional[str] = None,
+) -> list[dict]:
+    """Main entry point. Returns parsed listings not in seen_ids."""
     search_cfg = config["search"]
     delay = search_cfg.get("request_delay_seconds", 2.5)
     max_pages = search_cfg.get("max_pages_per_state", 10)
 
-    session = _make_session()
-    # Warm up the session with a homepage visit to get cookies
-    try:
-        session.get(BASE_URL, timeout=15)
-        time.sleep(1)
-    except requests.RequestException:
-        pass
+    session = requests.Session()
+    session.headers.update(HEADERS)
 
     all_urls: list[dict] = []
     for state_code, slug in search_cfg["state_slugs"].items():
         logger.info("Searching state: %s (%s)", state_code, slug)
-        urls = get_listing_urls_for_state(session, slug, max_pages=max_pages, delay=delay)
+        urls = _get_listing_urls_for_state(session, slug, max_pages=max_pages, delay=delay)
         logger.info("Found %d total listings for %s", len(urls), state_code)
         all_urls.extend(urls)
 
-    # Deduplicate across states
     seen_in_run: set[str] = set()
-    new_urls = []
-    for entry in all_urls:
-        lid = entry["id"]
-        if lid not in seen_ids and lid not in seen_in_run:
-            seen_in_run.add(lid)
-            new_urls.append(entry)
+    new_urls = [
+        e for e in all_urls
+        if e["id"] not in seen_ids and e["id"] not in seen_in_run
+        and not seen_in_run.add(e["id"])  # type: ignore[func-returns-value]
+    ]
 
     logger.info("%d new listings to fetch (out of %d total found)", len(new_urls), len(all_urls))
 
     listings = []
     for entry in new_urls:
-        detail = get_listing_detail(session, entry["id"], entry["url"], delay=delay)
+        detail = _get_listing_detail(
+            session, entry["id"], entry["url"], delay=delay, debug_html_dir=debug_html_dir
+        )
         if detail:
             listings.append(detail)
 

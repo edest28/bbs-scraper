@@ -98,7 +98,7 @@ def main(debug: bool = False) -> None:
 
     # ── 1. Scrape ──────────────────────────────────────────────────
     debug_html_dir = str(DATA_DIR / "debug") if debug else None
-    raw_listings = scrape_new_listings(config, seen_ids)
+    raw_listings = scrape_new_listings(config, seen_ids, debug_html_dir=debug_html_dir)
     logger.info("Scraped %d new raw listings", len(raw_listings))
 
     if not raw_listings:
